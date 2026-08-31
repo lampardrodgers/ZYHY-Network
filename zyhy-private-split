@@ -1,0 +1,717 @@
+#!/bin/bash
+# Split-route intranet via Wi-Fi only when Ethernet is up AND Wi-Fi DHCP
+# domain is ZYHY-Private. Otherwise keep system order (Ethernet first,
+# Wi-Fi if the cable is unplugged). Does not edit Shadowrocket.
+#
+#   sudo zyhy-private-split install
+#   sudo zyhy-private-split add oa.hq.cmcc
+#   sudo zyhy-private-split add '*.hq.cmcc'          # whole suffix
+#   sudo zyhy-private-split add 172.21.0.0/16        # whole CIDR
+#   sudo zyhy-private-split remove oa.hq.cmcc
+#        zyhy-private-split list
+#        zyhy-private-split status
+#        zyhy-private-split bundle ~/Desktop/zyhy-private-split.tgz
+#   sudo zyhy-private-split uninstall
+
+set -euo pipefail
+
+LABEL="com.zyhy.network.split"
+PLIST="/Library/LaunchDaemons/${LABEL}.plist"
+INSTALL_BIN="/usr/local/sbin/zyhy-private-split"
+CONF="/usr/local/etc/zyhy-private-split.conf"
+STATE_DIR="/var/run/zyhy-private-split"
+STATE_FILE="${STATE_DIR}/applied"
+RESOLVER_LIST="${STATE_DIR}/resolvers"
+HOSTS_BEGIN="# BEGIN zyhy-private-split"
+HOSTS_END="# END zyhy-private-split"
+
+# Defaults (overridden by $CONF).
+WIFI_DOMAIN="ZYHY-Private"
+DOMAINS="oa.hq.cmcc mail.cmhi.chinamobile.com"
+SUFFIXES="hq.cmcc cmhi.chinamobile.com"
+CIDRS="172.21.0.0/16 172.16.0.0/16"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >&2; }
+
+require_root() {
+  if [[ $(id -u) -ne 0 ]]; then
+    echo "need root: sudo $0 $*" >&2
+    exit 1
+  fi
+}
+
+normalize_words() {
+  echo "$*" | tr ' \t' '\n' | sed '/^$/d' | awk '!seen[$0]++'
+}
+
+load_config() {
+  if [[ -f "$CONF" ]]; then
+    # shellcheck disable=SC1090
+    . "$CONF"
+  fi
+  DOMAINS=$(normalize_words ${DOMAINS-} | tr '\n' ' ')
+  SUFFIXES=$(normalize_words ${SUFFIXES-} | tr '\n' ' ')
+  CIDRS=$(normalize_words ${CIDRS-} | tr '\n' ' ')
+  WIFI_DOMAIN=${WIFI_DOMAIN:-ZYHY-Private}
+  DOMAINS=${DOMAINS% }
+  SUFFIXES=${SUFFIXES% }
+  CIDRS=${CIDRS% }
+}
+
+save_config() {
+  mkdir -p "$(dirname "$CONF")"
+  cat >"$CONF" <<EOF
+# zyhy-private-split config
+# After editing: sudo zyhy-private-split apply
+#   add hostname:  sudo zyhy-private-split add foo.hq.cmcc
+#   add suffix:    sudo zyhy-private-split add '*.hq.cmcc'
+#   add CIDR:      sudo zyhy-private-split add 172.21.0.0/16
+
+WIFI_DOMAIN="${WIFI_DOMAIN}"
+DOMAINS="${DOMAINS}"
+SUFFIXES="${SUFFIXES}"
+CIDRS="${CIDRS}"
+EOF
+  chmod 644 "$CONF"
+}
+
+words_has() {
+  local needle=$1
+  shift
+  printf '%s\n' $* | grep -qxF "$needle"
+}
+
+add_word() {
+  local cur=$1 word=$2
+  if [[ -z "$cur" ]]; then
+    echo "$word"
+    return
+  fi
+  if printf '%s\n' $cur | grep -qxF "$word"; then
+    echo "$cur"
+    return
+  fi
+  echo "$cur $word"
+}
+
+remove_word() {
+  local cur=$1 word=$2
+  printf '%s\n' $cur | grep -vxF "$word" | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+}
+
+wifi_device() {
+  networksetup -listallhardwareports | awk '
+    /^Hardware Port: Wi-Fi/{getline; if ($1=="Device:") {print $2; exit}}
+  '
+}
+
+ethernet_devices() {
+  networksetup -listallhardwareports | awk '
+    /^Hardware Port: / {
+      port=$0
+      sub(/^Hardware Port: /,"",port)
+      getline
+      if ($1=="Device:") dev=$2
+      if (port=="Ethernet" || port ~ /^USB /) print dev
+    }
+  '
+}
+
+iface_active_ipv4() {
+  local ifc=$1
+  ifconfig "$ifc" 2>/dev/null | awk '
+    /status: active/{up=1}
+    $1=="inet"{ip=$2}
+    END{exit !(up && ip!="")}
+  '
+}
+
+wifi_is_private() {
+  local ifc=$1 domain
+  domain=$(ipconfig getoption "$ifc" domain_name 2>/dev/null || true)
+  [[ "$domain" == "$WIFI_DOMAIN" ]]
+}
+
+wired_up() {
+  local d
+  for d in $(ethernet_devices); do
+    if iface_active_ipv4 "$d"; then
+      echo "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+split_should_run() {
+  local wifi eth
+  wifi=$(wifi_device)
+  [[ -n "$wifi" ]] || return 1
+  iface_active_ipv4 "$wifi" || return 1
+  wifi_is_private "$wifi" || return 1
+  eth=$(wired_up) || return 1
+  echo "$eth $wifi"
+}
+
+add_host_v4() {
+  local ip=$1 gw=$2
+  if route -n get -host "$ip" 2>/dev/null | grep -q "gateway: ${gw}$"; then
+    return 0
+  fi
+  route -n delete -host "$ip" >/dev/null 2>&1 || true
+  route -n add -host "$ip" "$gw" >/dev/null
+}
+
+del_host_v4() {
+  route -n delete -host "$1" >/dev/null 2>&1 || true
+}
+
+add_net_v4() {
+  local cidr=$1 gw=$2
+  if route -n get -net "$cidr" 2>/dev/null | grep -q "gateway: ${gw}$"; then
+    return 0
+  fi
+  route -n delete -net "$cidr" >/dev/null 2>&1 || true
+  route -n add -net "$cidr" "$gw" >/dev/null
+}
+
+del_net_v4() {
+  route -n delete -net "$1" >/dev/null 2>&1 || true
+}
+
+del_reject_v6() {
+  route -n delete -inet6 -host "$1" >/dev/null 2>&1 || true
+}
+
+strip_hosts_block() {
+  awk -v b="$HOSTS_BEGIN" -v e="$HOSTS_END" '
+    $0==b {skip=1; next}
+    $0==e {skip=0; next}
+    skip==0 {print}
+  ' /etc/hosts
+}
+
+write_hosts_block() {
+  local body=$1 tmp
+  tmp=$(mktemp)
+  {
+    strip_hosts_block
+    if [[ -n "$body" ]]; then
+      printf '%s\n%s%s\n' "$HOSTS_BEGIN" "$body" "$HOSTS_END"
+    fi
+  } >"$tmp"
+  cat "$tmp" >/etc/hosts
+  rm -f "$tmp"
+}
+
+resolver_names() {
+  printf '%s\n' $DOMAINS $SUFFIXES | sed '/^$/d' | awk 'NF && !seen[$0]++'
+}
+
+clear_resolvers() {
+  local name
+  if [[ -f "$RESOLVER_LIST" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      rm -f "/etc/resolver/${name}"
+    done <"$RESOLVER_LIST"
+  fi
+  resolver_names | while IFS= read -r name; do
+    rm -f "/etc/resolver/${name}"
+  done
+}
+
+write_resolvers() {
+  local dns=$1 name
+  mkdir -p /etc/resolver
+  clear_resolvers
+  : >"$RESOLVER_LIST"
+  resolver_names | while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    cat >"/etc/resolver/${name}" <<EOF
+nameserver ${dns}
+timeout 2
+EOF
+    printf '%s\n' "$name" >>"$RESOLVER_LIST"
+  done
+}
+
+flush_dns() {
+  dscacheutil -flushcache >/dev/null 2>&1 || true
+  killall -HUP mDNSResponder >/dev/null 2>&1 || true
+}
+
+resolve_via_wifi() {
+  local wifi_ip=$1 dns=$2 name=$3
+  dig -b "$wifi_ip" @"$dns" +short +time=2 +tries=1 "$name" A \
+    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{print}'
+}
+
+wanted_proxy_exceptions() {
+  local d s
+  for d in $DOMAINS; do
+    printf '%s\n' "$d" "*.${d}"
+  done
+  for s in $SUFFIXES; do
+    printf '%s\n' "$s" "*.${s}"
+  done
+}
+
+http_proxy_keys() {
+  local key
+  echo "State:/Network/Global/Proxies"
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    if echo "show ${key}" | scutil | grep -q 'HTTPEnable : 1'; then
+      printf '%s\n' "$key"
+    fi
+  done < <(echo "list State:/Network/Service/.*/Proxies" | scutil | awk -F'= ' '/subKey/{print $2}')
+}
+
+read_proxy_exceptions() {
+  local key=${1-}
+  [[ -n "$key" ]] || key=$(http_proxy_keys | awk 'NR==2{print; exit} END{if(NR==1) print}')
+  echo "show ${key}" | scutil | awk '
+    /ExceptionsList[[:space:]]*:/ {inlist=1; next}
+    inlist && /}/ {exit}
+    inlist && /: / {
+      sub(/^[^:]+:[[:space:]]*/, "")
+      if ($0 != "") print
+    }
+  '
+}
+
+write_proxy_exceptions() {
+  local items=$*
+  local key
+  [[ -n "$items" ]] || return 0
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    scutil >/dev/null <<EOF
+open
+d.init
+get ${key}
+d.add ExceptionsList * ${items}
+set ${key}
+quit
+EOF
+  done < <(http_proxy_keys | awk 'NF && !seen[$0]++')
+}
+
+list_has() {
+  local needle=$1
+  shift
+  local y
+  for y in "$@"; do
+    [[ "$y" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+ensure_proxy_exceptions() {
+  local -a cur=() want=() merged=()
+  local x
+  while IFS= read -r x; do
+    [[ -n "$x" ]] && cur+=("$x")
+  done < <(read_proxy_exceptions "")
+  while IFS= read -r x; do
+    [[ -n "$x" ]] && want+=("$x")
+  done < <(wanted_proxy_exceptions | awk 'NF && !seen[$0]++')
+  if [[ ${#cur[@]} -gt 0 ]]; then
+    merged=("${cur[@]}")
+  fi
+  for x in "${want[@]}"; do
+    if [[ ${#cur[@]} -gt 0 ]] && list_has "$x" "${cur[@]}"; then
+      continue
+    fi
+    merged+=("$x")
+  done
+  if [[ ${#merged[@]} -eq ${#cur[@]} ]]; then
+    return 0
+  fi
+  write_proxy_exceptions "${merged[*]}"
+  log "proxy bypass +${want[*]}"
+}
+
+remove_proxy_exceptions() {
+  local -a cur=() keep=() want=()
+  local x
+  while IFS= read -r x; do
+    [[ -n "$x" ]] && cur+=("$x")
+  done < <(read_proxy_exceptions "")
+  [[ ${#cur[@]} -gt 0 ]] || return 0
+  while IFS= read -r x; do
+    [[ -n "$x" ]] && want+=("$x")
+  done < <(wanted_proxy_exceptions)
+  for x in "${cur[@]}"; do
+    if [[ ${#want[@]} -gt 0 ]] && list_has "$x" "${want[@]}"; then
+      continue
+    fi
+    keep+=("$x")
+  done
+  if [[ ${#keep[@]} -eq ${#cur[@]} ]]; then
+    return 0
+  fi
+  write_proxy_exceptions "${keep[*]}"
+  log "proxy bypass restored"
+}
+
+drop_state_entry() {
+  local kind=$1 target=$2
+  case "$kind" in
+    v6) del_reject_v6 "$target" ;;
+    net) del_net_v4 "$target" ;;
+    *) del_host_v4 "$target" ;;
+  esac
+}
+
+clear_applied() {
+  local kind ip
+  if [[ -f "$STATE_FILE" ]]; then
+    while read -r kind ip; do
+      [[ -n "$kind" ]] || continue
+      if [[ -z "$ip" ]]; then
+        ip=$kind
+        kind=v4
+      fi
+      drop_state_entry "$kind" "$ip"
+    done <"$STATE_FILE"
+  fi
+  write_hosts_block ""
+  clear_resolvers
+  remove_proxy_exceptions
+  rm -rf "$STATE_DIR"
+  flush_dns
+}
+
+cmd_clear() {
+  require_root
+  load_config
+  clear_applied
+  log "cleared split routes"
+}
+
+cmd_apply() {
+  require_root
+  load_config
+  mkdir -p "$STATE_DIR"
+  local pair eth wifi wifi_ip wifi_gw wifi_dns
+  if ! pair=$(split_should_run); then
+    if [[ -f "$STATE_FILE" ]]; then
+      log "condition not met; tearing down"
+      clear_applied
+    fi
+    return 0
+  fi
+  eth=${pair%% *}
+  wifi=${pair##* }
+  wifi_ip=$(ipconfig getifaddr "$wifi")
+  wifi_gw=$(ipconfig getoption "$wifi" router)
+  wifi_dns=$(ipconfig getoption "$wifi" domain_name_server | awk '{print $1}')
+  if [[ -z "$wifi_ip" || -z "$wifi_gw" || -z "$wifi_dns" ]]; then
+    log "wifi details incomplete; skip"
+    return 0
+  fi
+
+  local -a lines=()
+  local hosts_body="" d ip first cidr
+  add_host_v4 "$wifi_dns" "$wifi_gw"
+  lines+=("v4 $wifi_dns")
+
+  for cidr in $CIDRS; do
+    add_net_v4 "$cidr" "$wifi_gw"
+    lines+=("net $cidr")
+  done
+
+  for d in $DOMAINS; do
+    first=""
+    local resolved
+    resolved=$(resolve_via_wifi "$wifi_ip" "$wifi_dns" "$d" || true)
+    if [[ -z "$resolved" ]]; then
+      log "WARN: no A record for $d via $wifi_dns"
+      continue
+    fi
+    while read -r ip; do
+      [[ -n "$ip" ]] || continue
+      add_host_v4 "$ip" "$wifi_gw"
+      lines+=("v4 $ip")
+      if [[ -z "$first" ]]; then
+        first=$ip
+        hosts_body+="${ip} ${d}"$'\n'
+      fi
+    done <<<"$resolved"
+  done
+
+  write_resolvers "$wifi_dns"
+  write_hosts_block "$hosts_body"
+  ensure_proxy_exceptions
+
+  local tmp
+  tmp=$(mktemp)
+  printf '%s\n' "${lines[@]}" | awk 'NF && !seen[$0]++' | sort >"$tmp"
+  if [[ -f "$STATE_FILE" ]]; then
+    while read -r kind ip; do
+      [[ -n "$kind" ]] || continue
+      if [[ -z "$ip" ]]; then
+        ip=$kind
+        kind=v4
+      fi
+      if grep -qx "$kind $ip" "$tmp"; then
+        continue
+      fi
+      drop_state_entry "$kind" "$ip"
+    done <"$STATE_FILE"
+  fi
+  if [[ -f "$STATE_FILE" ]] && cmp -s "$tmp" "$STATE_FILE"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  mv "$tmp" "$STATE_FILE"
+  chmod 755 "$STATE_DIR" 2>/dev/null || true
+  chmod 644 "$STATE_FILE" "$RESOLVER_LIST" 2>/dev/null || true
+  flush_dns
+  log "applied via ${wifi} gw=${wifi_gw} dns=${wifi_dns} (wired ${eth}): $(tr '\n' ' ' <"$STATE_FILE")"
+}
+
+cmd_status() {
+  load_config
+  local wifi eth pair
+  wifi=$(wifi_device)
+  echo "wifi device : ${wifi:-none}"
+  if [[ -n "$wifi" ]]; then
+    echo "wifi ip     : $(ipconfig getifaddr "$wifi" 2>/dev/null || echo none)"
+    echo "wifi domain : $(ipconfig getoption "$wifi" domain_name 2>/dev/null || echo none)"
+    echo "wifi dns    : $(ipconfig getoption "$wifi" domain_name_server 2>/dev/null || echo none)"
+    echo "wifi gw     : $(ipconfig getoption "$wifi" router 2>/dev/null || echo none)"
+  fi
+  echo "wired ifaces: $(ethernet_devices | tr '\n' ' ')"
+  if eth=$(wired_up); then
+    echo "wired up    : $eth $(ipconfig getifaddr "$eth")"
+  else
+    echo "wired up    : no"
+  fi
+  if pair=$(split_should_run); then
+    echo "split cond  : YES ($pair)"
+  else
+    echo "split cond  : no"
+  fi
+  echo "config      : $CONF"
+  echo "domains     : ${DOMAINS:-<none>}"
+  echo "suffixes    : ${SUFFIXES:-<none>}"
+  echo "cidrs       : ${CIDRS:-<none>}"
+  echo "state file  : $( [[ -f $STATE_FILE ]] && echo present || echo absent )"
+  if [[ -r "$STATE_FILE" ]]; then
+    echo "routed:"
+    sed 's/^/  /' "$STATE_FILE"
+  elif [[ -f "$STATE_FILE" ]]; then
+    echo "routed: (not readable without root)"
+  fi
+  echo "hosts block :"
+  awk -v b="$HOSTS_BEGIN" -v e="$HOSTS_END" '
+    $0==b{on=1}
+    on{print "  "$0}
+    $0==e{on=0}
+  ' /etc/hosts || true
+  echo "daemon      : $(launchctl print "system/${LABEL}" >/dev/null 2>&1 && echo loaded || echo not-loaded)"
+  echo "sys proxy   : $(scutil --proxy | awk '/HTTPEnable/{e=$3} /HTTPProxy/{p=$3} /HTTPPort/{n=$3} END{if(e==1) print p":"n; else print "off"}')"
+  echo "proxy bypass:"
+  read_proxy_exceptions | sed 's/^/  /' || true
+  local d
+  for d in $DOMAINS; do
+    echo "resolve $d:"
+    dscacheutil -q host -a name "$d" 2>/dev/null | sed 's/^/  /' || true
+  done
+}
+
+cmd_list() {
+  load_config
+  echo "config   : $CONF"
+  echo "domains  :"
+  printf '%s\n' $DOMAINS | sed 's/^/  /'
+  echo "suffixes :"
+  printf '%s\n' $SUFFIXES | sed 's/^/  /'
+  echo "cidrs    :"
+  printf '%s\n' $CIDRS | sed 's/^/  /'
+}
+
+classify_item() {
+  local item=$1
+  case "$item" in
+    */*) echo cidr ;;
+    \*.*) echo suffix ;;
+    *) echo domain ;;
+  esac
+}
+
+normalize_item() {
+  local kind=$1 item=$2
+  case "$kind" in
+    suffix) echo "${item#\*.}" ;;
+    *) echo "$item" ;;
+  esac
+}
+
+cmd_add() {
+  require_root
+  load_config
+  local item=${1-} kind
+  [[ -n "$item" ]] || { echo "usage: $0 add <host|*.suffix|cidr>" >&2; exit 2; }
+  kind=$(classify_item "$item")
+  item=$(normalize_item "$kind" "$item")
+  case "$kind" in
+    cidr) DOMAINS="$DOMAINS"; CIDRS=$(add_word "$CIDRS" "$item") ;;
+    suffix) SUFFIXES=$(add_word "$SUFFIXES" "$item") ;;
+    domain) DOMAINS=$(add_word "$DOMAINS" "$item") ;;
+  esac
+  save_config
+  log "added $kind $item"
+  cmd_apply
+}
+
+cmd_remove() {
+  require_root
+  load_config
+  local item=${1-} kind
+  [[ -n "$item" ]] || { echo "usage: $0 remove <host|*.suffix|cidr>" >&2; exit 2; }
+  kind=$(classify_item "$item")
+  item=$(normalize_item "$kind" "$item")
+  case "$kind" in
+    cidr) CIDRS=$(remove_word "$CIDRS" "$item") ;;
+    suffix) SUFFIXES=$(remove_word "$SUFFIXES" "$item") ;;
+    domain) DOMAINS=$(remove_word "$DOMAINS" "$item") ;;
+  esac
+  save_config
+  log "removed $kind $item"
+  cmd_apply
+}
+
+write_install_plist() {
+  local bin=$1
+  cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${bin}</string>
+    <string>apply</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>/var/log/zyhy-private-split.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/zyhy-private-split.log</string>
+</dict>
+</plist>
+EOF
+  chmod 644 "$PLIST"
+}
+
+cmd_install() {
+  require_root
+  local self
+  self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  mkdir -p /usr/local/sbin /usr/local/etc
+  if [[ "$self" != "$INSTALL_BIN" ]]; then
+    cp "$self" "$INSTALL_BIN"
+  fi
+  chmod 755 "$INSTALL_BIN"
+  load_config
+  save_config
+  write_install_plist "$INSTALL_BIN"
+  launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
+  launchctl bootstrap system "$PLIST"
+  launchctl kickstart -k "system/${LABEL}"
+  log "installed ${INSTALL_BIN} + ${CONF}"
+  cmd_apply
+}
+
+cmd_uninstall() {
+  require_root
+  load_config
+  launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
+  rm -f "$PLIST"
+  clear_applied
+  log "uninstalled (config kept at ${CONF})"
+}
+
+cmd_bundle() {
+  load_config
+  local dest=${1-} tmp
+  if [[ -z "$dest" ]]; then
+    dest="$HOME/Downloads/zyhy-private-split.tgz"
+  fi
+  tmp=$(mktemp -d)
+  mkdir -p "$tmp/zyhy-private-split"
+  local src
+  src=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  cp "$src" "$tmp/zyhy-private-split/zyhy-private-split"
+  chmod 755 "$tmp/zyhy-private-split/zyhy-private-split"
+  if [[ -f "$CONF" ]]; then
+    cp "$CONF" "$tmp/zyhy-private-split/zyhy-private-split.conf"
+  else
+    WIFI_DOMAIN="$WIFI_DOMAIN" DOMAINS="$DOMAINS" SUFFIXES="$SUFFIXES" CIDRS="$CIDRS"
+    cat >"$tmp/zyhy-private-split/zyhy-private-split.conf" <<EOF
+WIFI_DOMAIN="${WIFI_DOMAIN}"
+DOMAINS="${DOMAINS}"
+SUFFIXES="${SUFFIXES}"
+CIDRS="${CIDRS}"
+EOF
+  fi
+  cat >"$tmp/zyhy-private-split/INSTALL.txt" <<'EOF'
+macOS only. Target machine also needs Ethernet + Wi-Fi ZYHY-Private.
+
+  chmod 755 zyhy-private-split
+  sudo mkdir -p /usr/local/etc
+  sudo cp zyhy-private-split.conf /usr/local/etc/zyhy-private-split.conf
+  sudo ./zyhy-private-split install
+
+Then:
+  zyhy-private-split status
+  sudo zyhy-private-split add '*.hq.cmcc'
+  sudo zyhy-private-split add 172.21.0.0/16
+EOF
+  tar -C "$tmp" -czf "$dest" zyhy-private-split
+  rm -rf "$tmp"
+  echo "bundle: $dest"
+}
+
+usage() {
+  cat <<EOF
+usage: $0 <command>
+
+  status                 show split state
+  list                   show domains / suffixes / CIDRs
+  add <item>             add host, '*.suffix', or CIDR (needs sudo)
+  remove <item>          remove one of the above (needs sudo)
+  apply                  apply now (needs sudo; daemon does this every 5s)
+  clear                  tear down routes (needs sudo)
+  install                copy to /usr/local/sbin and load daemon (needs sudo)
+  uninstall              remove daemon and routes; keep config (needs sudo)
+  bundle [path.tgz]      pack script+config for another Mac
+EOF
+  exit 2
+}
+
+cmd=${1:-status}
+shift || true
+load_config
+case "$cmd" in
+  apply) cmd_apply ;;
+  clear) cmd_clear ;;
+  status) cmd_status ;;
+  list) cmd_list ;;
+  add) cmd_add "${1-}" ;;
+  remove) cmd_remove "${1-}" ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  bundle) cmd_bundle "${1-}" ;;
+  help|-h|--help) usage ;;
+  *) usage ;;
+esac
