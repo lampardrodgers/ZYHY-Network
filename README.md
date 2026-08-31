@@ -1,15 +1,21 @@
 # ZYHY-Network
 
-Mac 同时插网线、连 Wi-Fi **ZYHY-Private** 时：
+办公时不用再在「网线」和「公司 Wi-Fi」之间来回切。
 
-- 普通上网走网线
-- 公司内网走 Wi-Fi
+- 看网页、刷视频、走代理：用网线
+- 打开 OA、邮箱、iHR：自动走公司 Wi-Fi `ZYHY-Private`
 
-已经按一台可用机器配好，别人下载就能用。
+两个可以同时开着。
 
-## 安装
+## 你需要
 
-电脑：macOS，网线 + Wi-Fi 名称是 `ZYHY-Private`。
+1. 一台 Mac
+2. 插上公司网线
+3. Wi-Fi 连上 **ZYHY-Private**（不要连别的公司 Wi-Fi）
+
+## 怎么装
+
+打开「终端」，把下面三行粘贴进去，回车，输入开机密码：
 
 ```bash
 git clone https://github.com/lampardrodgers/ZYHY-Network.git
@@ -17,14 +23,20 @@ cd ZYHY-Network
 sudo ./install.sh
 ```
 
-然后新开浏览器标签打开 OA / 邮箱。Chrome 请关掉「使用安全 DNS」。
+装完后：
 
-## 已经包含
+1. 用 **新标签页** 打开 OA、邮箱（不要刷新刚才失败的那一页）
+2. 如果用的是 Chrome：设置 → 隐私和安全 → 安全 → 关掉「使用安全 DNS」
 
-- `oa.hq.cmcc` 以及其它 `*.hq.cmcc`（含 iHR）
-- `mail.cmhi.chinamobile.com` 以及 `*.cmhi.chinamobile.com`
+能打开就行，不用再配域名。
 
-## 卸载
+## 用的时候注意
+
+- 网线要插着，Wi-Fi 必须是 `ZYHY-Private`，分流才会开
+- 拔掉网线、或换成别的 Wi-Fi：全部按系统原来的方式上网，内网入口可能会打不开
+- 插回网线并连回 `ZYHY-Private`：等几秒会自动恢复
+
+## 不想用了
 
 ```bash
 sudo zyhy-private-split uninstall
