@@ -1,0 +1,44 @@
+{
+  "name": "@sunjiehao/zyhy-network",
+  "version": "0.2.1",
+  "description": "macOS Ethernet and ZYHY-Private Wi-Fi split routing CLI",
+  "bin": {
+    "zyhy-network": "bin/zyhy-network.js"
+  },
+  "files": [
+    "bin/",
+    "zyhy-private-split",
+    "zyhy-private-split.conf",
+    "install.sh",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "bash -n zyhy-private-split install.sh bin/zyhy-network && node --check bin/zyhy-network.js",
+    "prepack": "npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lampardrodgers/ZYHY-Network.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bugs": {
+    "url": "https://github.com/lampardrodgers/ZYHY-Network/issues"
+  },
+  "homepage": "https://github.com/lampardrodgers/ZYHY-Network#readme",
+  "keywords": [
+    "macos",
+    "network",
+    "split-routing",
+    "launchd"
+  ],
+  "author": "sunjiehao (lampardrodgers)",
+  "license": "UNLICENSED",
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

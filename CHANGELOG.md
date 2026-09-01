@@ -1,5 +1,17 @@
 # 更新日志
 
+## V0.2.1 - 2026-09-01
+
+### Added
+
+- 发布 npm 包 `@sunjiehao/zyhy-network`。
+- 增加统一的 `zyhy-network` 命令，GitHub 与 npm 安装方式均可使用。
+- 增加 `zyhy-network refresh`，用于立即刷新 DNS、路由和分流配置。
+
+### Fixed
+
+- LaunchDaemon 加载失败时自动重试，降低安装过程中的偶发失败。
+
 ## V0.2.0 - 2026-09-01
 
 ### Changed

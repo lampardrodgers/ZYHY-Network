@@ -8,6 +8,7 @@
 #   sudo zyhy-private-split add '*.hq.cmcc'          # whole suffix
 #   sudo zyhy-private-split add 172.21.0.0/16        # whole CIDR
 #   sudo zyhy-private-split remove oa.hq.cmcc
+#   sudo zyhy-private-split refresh
 #        zyhy-private-split list
 #        zyhy-private-split status
 #        zyhy-private-split bundle ~/Desktop/zyhy-private-split.tgz
@@ -16,11 +17,13 @@
 set -euo pipefail
 
 LABEL="com.zyhy.network.split"
+VERSION="0.2.1"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 RECONCILE_LABEL="${LABEL}.reconcile"
 RECONCILE_PLIST="/Library/LaunchDaemons/${RECONCILE_LABEL}.plist"
 LEGACY_LABELS="com.misakamikoto.zyhy-private-split"
 INSTALL_BIN="/usr/local/sbin/zyhy-private-split"
+INSTALL_CLI="/usr/local/bin/zyhy-network"
 CONF="/usr/local/etc/zyhy-private-split.conf"
 STATE_DIR="/var/run/zyhy-private-split"
 STATE_FILE="${STATE_DIR}/applied"
@@ -608,6 +611,12 @@ cmd_apply() {
   return "$rc"
 }
 
+cmd_refresh() {
+  require_root
+  cmd_apply --force
+  echo "refreshed: routes, DNS, hosts, resolvers and proxy exceptions checked"
+}
+
 cmd_status() {
   load_config
   local wifi eth pair
@@ -833,6 +842,22 @@ EOF
   chmod 644 "$PLIST" "$RECONCILE_PLIST"
 }
 
+bootstrap_with_retry() {
+  local plist=$1 attempt=1 output=""
+  while (( attempt <= 5 )); do
+    if output=$(launchctl bootstrap system "$plist" 2>&1); then
+      return 0
+    fi
+    if (( attempt == 5 )); then
+      echo "$output" >&2
+      return 1
+    fi
+    log "WARN: launchd bootstrap retry ${attempt}/5 for $(basename "$plist")"
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+}
+
 cmd_install() {
   require_root
   local self legacy_label
@@ -854,9 +879,11 @@ cmd_install() {
   done
   write_install_plists "$INSTALL_BIN"
   cmd_apply --force
-  launchctl bootstrap system "$PLIST"
-  launchctl bootstrap system "$RECONCILE_PLIST"
-  launchctl kickstart -k "system/${LABEL}"
+  bootstrap_with_retry "$PLIST"
+  if ! bootstrap_with_retry "$RECONCILE_PLIST"; then
+    launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
+    return 1
+  fi
   log "installed ${INSTALL_BIN} + ${CONF}"
 }
 
@@ -871,6 +898,10 @@ cmd_uninstall() {
     rm -f "/Library/LaunchDaemons/${legacy_label}.plist"
   done
   rm -f "$PLIST" "$RECONCILE_PLIST"
+  if [[ -f "$INSTALL_CLI" ]] && \
+     grep -q '^# zyhy-network managed GitHub-install wrapper$' "$INSTALL_CLI" 2>/dev/null; then
+    rm -f "$INSTALL_CLI"
+  fi
   clear_applied
   log "uninstalled (config kept at ${CONF})"
 }
@@ -925,6 +956,7 @@ usage: $0 <command>
   list                   show domains / suffixes / CIDRs
   add <item>             add host, '*.suffix', or CIDR (needs sudo)
   remove <item>          remove one of the above (needs sudo)
+  refresh                force DNS resolution and reconcile now (needs sudo)
   apply [--force]        apply now; --force also reconciles DNS (needs sudo)
   clear                  tear down routes (needs sudo)
   install                copy to /usr/local/sbin and load daemon (needs sudo)
@@ -939,6 +971,7 @@ shift || true
 load_config
 case "$cmd" in
   apply) cmd_apply "${1-}" ;;
+  refresh) cmd_refresh ;;
   watch) cmd_watch ;;
   clear) cmd_clear ;;
   status) cmd_status ;;
@@ -949,5 +982,6 @@ case "$cmd" in
   uninstall) cmd_uninstall ;;
   bundle) cmd_bundle "${1-}" ;;
   help|-h|--help) usage ;;
+  -v|--version) echo "$VERSION" ;;
   *) usage ;;
 esac

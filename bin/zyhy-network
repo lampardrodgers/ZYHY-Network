@@ -1,0 +1,21 @@
+#!/bin/bash
+# zyhy-network managed GitHub-install wrapper
+set -euo pipefail
+
+TARGET="/usr/local/sbin/zyhy-private-split"
+
+if [[ ! -x "$TARGET" ]]; then
+  echo "zyhy-network is not installed; run sudo ./install.sh first" >&2
+  exit 1
+fi
+
+command=${1:-status}
+case "$command" in
+  add|apply|clear|install|refresh|remove|uninstall)
+    if [[ $(id -u) -ne 0 ]]; then
+      exec /usr/bin/sudo "$TARGET" "$@"
+    fi
+    ;;
+esac
+
+exec "$TARGET" "$@"
