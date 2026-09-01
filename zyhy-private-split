@@ -17,11 +17,20 @@ set -euo pipefail
 
 LABEL="com.zyhy.network.split"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
+RECONCILE_LABEL="${LABEL}.reconcile"
+RECONCILE_PLIST="/Library/LaunchDaemons/${RECONCILE_LABEL}.plist"
+LEGACY_LABELS="com.misakamikoto.zyhy-private-split"
 INSTALL_BIN="/usr/local/sbin/zyhy-private-split"
 CONF="/usr/local/etc/zyhy-private-split.conf"
 STATE_DIR="/var/run/zyhy-private-split"
 STATE_FILE="${STATE_DIR}/applied"
+INPUT_STATE_FILE="${STATE_DIR}/network-inputs"
+RESOLVED_STATE_FILE="${STATE_DIR}/resolved-hosts"
 RESOLVER_LIST="${STATE_DIR}/resolvers"
+LOCK_DIR="/var/run/zyhy-private-split.apply.lock"
+WATCH_DIR="/var/run/zyhy-private-split-watch"
+WATCH_COMMAND_FIFO="${WATCH_DIR}/commands"
+WATCH_EVENT_FIFO="${WATCH_DIR}/events"
 HOSTS_BEGIN="# BEGIN zyhy-private-split"
 HOSTS_END="# END zyhy-private-split"
 
@@ -30,6 +39,11 @@ WIFI_DOMAIN="ZYHY-Private"
 DOMAINS="oa.hq.cmcc mail.cmhi.chinamobile.com"
 SUFFIXES="hq.cmcc cmhi.chinamobile.com"
 CIDRS="172.21.0.0/16 172.16.0.0/16"
+RECONCILE_INTERVAL="300"
+EVENT_SETTLE_SECONDS="2"
+
+FILES_CHANGED=0
+WATCH_CHILD_PID=""
 
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >&2; }
 
@@ -53,6 +67,10 @@ load_config() {
   SUFFIXES=$(normalize_words ${SUFFIXES-} | tr '\n' ' ')
   CIDRS=$(normalize_words ${CIDRS-} | tr '\n' ' ')
   WIFI_DOMAIN=${WIFI_DOMAIN:-ZYHY-Private}
+  RECONCILE_INTERVAL=${RECONCILE_INTERVAL:-300}
+  EVENT_SETTLE_SECONDS=${EVENT_SETTLE_SECONDS:-2}
+  [[ "$RECONCILE_INTERVAL" =~ ^[0-9]+$ ]] || RECONCILE_INTERVAL=300
+  [[ "$EVENT_SETTLE_SECONDS" =~ ^[0-9]+$ ]] || EVENT_SETTLE_SECONDS=2
   DOMAINS=${DOMAINS% }
   SUFFIXES=${SUFFIXES% }
   CIDRS=${CIDRS% }
@@ -71,6 +89,8 @@ WIFI_DOMAIN="${WIFI_DOMAIN}"
 DOMAINS="${DOMAINS}"
 SUFFIXES="${SUFFIXES}"
 CIDRS="${CIDRS}"
+RECONCILE_INTERVAL="${RECONCILE_INTERVAL}"
+EVENT_SETTLE_SECONDS="${EVENT_SETTLE_SECONDS}"
 EOF
   chmod 644 "$CONF"
 }
@@ -200,8 +220,13 @@ write_hosts_block() {
       printf '%s\n%s%s\n' "$HOSTS_BEGIN" "$body" "$HOSTS_END"
     fi
   } >"$tmp"
+  if cmp -s "$tmp" /etc/hosts; then
+    rm -f "$tmp"
+    return 0
+  fi
   cat "$tmp" >/etc/hosts
   rm -f "$tmp"
+  FILES_CHANGED=1
 }
 
 resolver_names() {
@@ -210,30 +235,55 @@ resolver_names() {
 
 clear_resolvers() {
   local name
-  if [[ -f "$RESOLVER_LIST" ]]; then
-    while IFS= read -r name; do
-      [[ -n "$name" ]] || continue
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if [[ -e "/etc/resolver/${name}" ]]; then
       rm -f "/etc/resolver/${name}"
-    done <"$RESOLVER_LIST"
-  fi
-  resolver_names | while IFS= read -r name; do
-    rm -f "/etc/resolver/${name}"
-  done
+      FILES_CHANGED=1
+    fi
+  done < <(
+    {
+      [[ -f "$RESOLVER_LIST" ]] && cat "$RESOLVER_LIST"
+      resolver_names
+    } | awk 'NF && !seen[$0]++'
+  )
 }
 
 write_resolvers() {
-  local dns=$1 name
+  local dns=$1 name old_name desired_list resolver_tmp
   mkdir -p /etc/resolver
-  clear_resolvers
-  : >"$RESOLVER_LIST"
-  resolver_names | while IFS= read -r name; do
+  desired_list=$(mktemp)
+  resolver_names >"$desired_list"
+
+  if [[ -f "$RESOLVER_LIST" ]]; then
+    while IFS= read -r old_name; do
+      [[ -n "$old_name" ]] || continue
+      if ! grep -qxF "$old_name" "$desired_list" && [[ -e "/etc/resolver/${old_name}" ]]; then
+        rm -f "/etc/resolver/${old_name}"
+        FILES_CHANGED=1
+      fi
+    done <"$RESOLVER_LIST"
+  fi
+
+  while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    cat >"/etc/resolver/${name}" <<EOF
+    resolver_tmp=$(mktemp)
+    cat >"$resolver_tmp" <<EOF
 nameserver ${dns}
 timeout 2
 EOF
-    printf '%s\n' "$name" >>"$RESOLVER_LIST"
-  done
+    if ! cmp -s "$resolver_tmp" "/etc/resolver/${name}"; then
+      cat "$resolver_tmp" >"/etc/resolver/${name}"
+      FILES_CHANGED=1
+    fi
+    rm -f "$resolver_tmp"
+  done <"$desired_list"
+
+  if ! cmp -s "$desired_list" "$RESOLVER_LIST"; then
+    mv "$desired_list" "$RESOLVER_LIST"
+  else
+    rm -f "$desired_list"
+  fi
 }
 
 flush_dns() {
@@ -244,7 +294,8 @@ flush_dns() {
 resolve_via_wifi() {
   local wifi_ip=$1 dns=$2 name=$3
   dig -b "$wifi_ip" @"$dns" +short +time=2 +tries=1 "$name" A \
-    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{print}'
+    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{print}' \
+    | sort -u
 }
 
 wanted_proxy_exceptions() {
@@ -391,10 +442,48 @@ cmd_clear() {
   log "cleared split routes"
 }
 
-cmd_apply() {
-  require_root
+write_network_inputs() {
+  local dest=$1 eth=$2 wifi=$3 wifi_ip=$4 wifi_gw=$5 wifi_dns=$6
+  {
+    printf 'ethernet=%s\n' "$eth"
+    printf 'ethernet_ip=%s\n' "$(ipconfig getifaddr "$eth" 2>/dev/null || true)"
+    printf 'wifi=%s\n' "$wifi"
+    printf 'wifi_ip=%s\n' "$wifi_ip"
+    printf 'wifi_gateway=%s\n' "$wifi_gw"
+    printf 'wifi_dns=%s\n' "$wifi_dns"
+    printf 'wifi_domain=%s\n' "$(ipconfig getoption "$wifi" domain_name 2>/dev/null || true)"
+    printf 'domains=%s\n' "$DOMAINS"
+    printf 'suffixes=%s\n' "$SUFFIXES"
+    printf 'cidrs=%s\n' "$CIDRS"
+  } >"$dest"
+}
+
+acquire_apply_lock() {
+  local old_pid=""
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" >"${LOCK_DIR}/pid"
+    return 0
+  fi
+  [[ -r "${LOCK_DIR}/pid" ]] && old_pid=$(<"${LOCK_DIR}/pid")
+  if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
+    return 1
+  fi
+  rm -f "${LOCK_DIR}/pid"
+  rmdir "$LOCK_DIR" 2>/dev/null || return 1
+  mkdir "$LOCK_DIR"
+  printf '%s\n' "$$" >"${LOCK_DIR}/pid"
+}
+
+release_apply_lock() {
+  rm -f "${LOCK_DIR}/pid"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+cmd_apply_locked() {
+  local force=${1-}
   load_config
   mkdir -p "$STATE_DIR"
+  FILES_CHANGED=0
   local pair eth wifi wifi_ip wifi_gw wifi_dns
   if ! pair=$(split_should_run); then
     if [[ -f "$STATE_FILE" ]]; then
@@ -413,8 +502,18 @@ cmd_apply() {
     return 0
   fi
 
+  local input_tmp
+  input_tmp=$(mktemp)
+  write_network_inputs "$input_tmp" "$eth" "$wifi" "$wifi_ip" "$wifi_gw" "$wifi_dns"
+  if [[ "$force" != "--force" && -f "$STATE_FILE" && -f "$INPUT_STATE_FILE" ]] \
+    && cmp -s "$input_tmp" "$INPUT_STATE_FILE"; then
+    rm -f "$input_tmp"
+    return 0
+  fi
+
   local -a lines=()
-  local hosts_body="" d ip first cidr
+  local hosts_body="" d ip first cidr resolved resolved_tmp previous
+  resolved_tmp=$(mktemp)
   add_host_v4 "$wifi_dns" "$wifi_gw"
   lines+=("v4 $wifi_dns")
 
@@ -425,14 +524,22 @@ cmd_apply() {
 
   for d in $DOMAINS; do
     first=""
-    local resolved
     resolved=$(resolve_via_wifi "$wifi_ip" "$wifi_dns" "$d" || true)
     if [[ -z "$resolved" ]]; then
-      log "WARN: no A record for $d via $wifi_dns"
-      continue
+      previous=""
+      if [[ -f "$RESOLVED_STATE_FILE" ]]; then
+        previous=$(awk -v domain="$d" '$1==domain {print $2}' "$RESOLVED_STATE_FILE")
+      fi
+      if [[ -z "$previous" ]]; then
+        log "WARN: no A record for $d via $wifi_dns"
+        continue
+      fi
+      log "WARN: no A record for $d via $wifi_dns; keeping previous result"
+      resolved=$previous
     fi
     while read -r ip; do
       [[ -n "$ip" ]] || continue
+      printf '%s %s\n' "$d" "$ip" >>"$resolved_tmp"
       add_host_v4 "$ip" "$wifi_gw"
       lines+=("v4 $ip")
       if [[ -z "$first" ]]; then
@@ -446,7 +553,7 @@ cmd_apply() {
   write_hosts_block "$hosts_body"
   ensure_proxy_exceptions
 
-  local tmp
+  local tmp state_changed=0
   tmp=$(mktemp)
   printf '%s\n' "${lines[@]}" | awk 'NF && !seen[$0]++' | sort >"$tmp"
   if [[ -f "$STATE_FILE" ]]; then
@@ -464,13 +571,41 @@ cmd_apply() {
   fi
   if [[ -f "$STATE_FILE" ]] && cmp -s "$tmp" "$STATE_FILE"; then
     rm -f "$tmp"
+  else
+    mv "$tmp" "$STATE_FILE"
+    state_changed=1
+  fi
+
+  if ! cmp -s "$input_tmp" "$INPUT_STATE_FILE"; then
+    mv "$input_tmp" "$INPUT_STATE_FILE"
+  else
+    rm -f "$input_tmp"
+  fi
+  if ! cmp -s "$resolved_tmp" "$RESOLVED_STATE_FILE"; then
+    mv "$resolved_tmp" "$RESOLVED_STATE_FILE"
+  else
+    rm -f "$resolved_tmp"
+  fi
+
+  chmod 755 "$STATE_DIR" 2>/dev/null || true
+  chmod 644 "$STATE_FILE" "$INPUT_STATE_FILE" "$RESOLVED_STATE_FILE" "$RESOLVER_LIST" 2>/dev/null || true
+  if [[ "$FILES_CHANGED" -eq 1 ]]; then
+    flush_dns
+  fi
+  if [[ "$state_changed" -eq 1 || "$FILES_CHANGED" -eq 1 ]]; then
+    log "applied via ${wifi} gw=${wifi_gw} dns=${wifi_dns} (wired ${eth}): $(tr '\n' ' ' <"$STATE_FILE")"
+  fi
+}
+
+cmd_apply() {
+  require_root
+  if ! acquire_apply_lock; then
     return 0
   fi
-  mv "$tmp" "$STATE_FILE"
-  chmod 755 "$STATE_DIR" 2>/dev/null || true
-  chmod 644 "$STATE_FILE" "$RESOLVER_LIST" 2>/dev/null || true
-  flush_dns
-  log "applied via ${wifi} gw=${wifi_gw} dns=${wifi_dns} (wired ${eth}): $(tr '\n' ' ' <"$STATE_FILE")"
+  local rc=0
+  cmd_apply_locked "${1-}" || rc=$?
+  release_apply_lock
+  return "$rc"
 }
 
 cmd_status() {
@@ -512,7 +647,8 @@ cmd_status() {
     on{print "  "$0}
     $0==e{on=0}
   ' /etc/hosts || true
-  echo "daemon      : $(launchctl print "system/${LABEL}" >/dev/null 2>&1 && echo loaded || echo not-loaded)"
+  echo "watcher     : $(launchctl print "system/${LABEL}" >/dev/null 2>&1 && echo loaded || echo not-loaded)"
+  echo "reconcile   : $(launchctl print "system/${RECONCILE_LABEL}" >/dev/null 2>&1 && echo "loaded (${RECONCILE_INTERVAL}s)" || echo not-loaded)"
   echo "sys proxy   : $(scutil --proxy | awk '/HTTPEnable/{e=$3} /HTTPProxy/{p=$3} /HTTPPort/{n=$3} END{if(e==1) print p":"n; else print "off"}')"
   echo "proxy bypass:"
   read_proxy_exceptions | sed 's/^/  /' || true
@@ -585,7 +721,66 @@ cmd_remove() {
   cmd_apply
 }
 
-write_install_plist() {
+close_network_event_stream() {
+  { exec 3>&-; } 2>/dev/null || true
+  { exec 4<&-; } 2>/dev/null || true
+  if [[ "$WATCH_CHILD_PID" =~ ^[0-9]+$ ]]; then
+    kill "$WATCH_CHILD_PID" >/dev/null 2>&1 || true
+    wait "$WATCH_CHILD_PID" 2>/dev/null || true
+  fi
+  WATCH_CHILD_PID=""
+  rm -f "$WATCH_COMMAND_FIFO" "$WATCH_EVENT_FIFO"
+  rmdir "$WATCH_DIR" 2>/dev/null || true
+}
+
+stop_watch() {
+  close_network_event_stream
+  exit 0
+}
+
+start_network_event_stream() {
+  mkdir -p "$WATCH_DIR"
+  rm -f "$WATCH_COMMAND_FIFO" "$WATCH_EVENT_FIFO"
+  mkfifo "$WATCH_COMMAND_FIFO" "$WATCH_EVENT_FIFO"
+  /usr/sbin/scutil <"$WATCH_COMMAND_FIFO" >"$WATCH_EVENT_FIFO" 2>/dev/null &
+  WATCH_CHILD_PID=$!
+  exec 3>"$WATCH_COMMAND_FIFO"
+  exec 4<"$WATCH_EVENT_FIFO"
+  cat >&3 <<'EOF'
+n.add ^State:/Network/(Global/(IPv4|DNS)|Interface/.*/(IPv4|Link|AirPort)|Service/.*/(DHCP|DNS|IPv4))$ pattern
+n.add ^Setup:/Network/Service/.*/(DNS|IPv4)$ pattern
+n.watch
+EOF
+}
+
+cmd_watch() {
+  require_root
+  trap stop_watch INT TERM
+  log "network watcher started"
+  cmd_apply --force
+  local line now last_apply=0
+  while :; do
+    start_network_event_stream
+    while IFS= read -r line <&4; do
+      case "$line" in
+        *"changedKey ["*) ;;
+        *) continue ;;
+      esac
+      now=$(date +%s)
+      if (( now - last_apply <= EVENT_SETTLE_SECONDS )); then
+        continue
+      fi
+      sleep "$EVENT_SETTLE_SECONDS"
+      cmd_apply
+      last_apply=$(date +%s)
+    done
+    close_network_event_stream
+    log "WARN: network event stream stopped; retrying"
+    sleep 5
+  done
+}
+
+write_install_plists() {
   local bin=$1
   cat >"$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -597,12 +792,14 @@ write_install_plist() {
   <key>ProgramArguments</key>
   <array>
     <string>${bin}</string>
-    <string>apply</string>
+    <string>watch</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
-  <key>StartInterval</key>
-  <integer>5</integer>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
   <key>StandardOutPath</key>
   <string>/var/log/zyhy-private-split.log</string>
   <key>StandardErrorPath</key>
@@ -610,13 +807,41 @@ write_install_plist() {
 </dict>
 </plist>
 EOF
-  chmod 644 "$PLIST"
+
+  cat >"$RECONCILE_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${RECONCILE_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${bin}</string>
+    <string>apply</string>
+    <string>--force</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>${RECONCILE_INTERVAL}</integer>
+  <key>StandardOutPath</key>
+  <string>/var/log/zyhy-private-split.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/zyhy-private-split.log</string>
+</dict>
+</plist>
+EOF
+  chmod 644 "$PLIST" "$RECONCILE_PLIST"
 }
 
 cmd_install() {
   require_root
-  local self
+  local self legacy_label
   self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
+  launchctl bootout "system/${RECONCILE_LABEL}" >/dev/null 2>&1 || true
+  for legacy_label in $LEGACY_LABELS; do
+    launchctl bootout "system/${legacy_label}" >/dev/null 2>&1 || true
+  done
   mkdir -p /usr/local/sbin /usr/local/etc
   if [[ "$self" != "$INSTALL_BIN" ]]; then
     cp "$self" "$INSTALL_BIN"
@@ -624,19 +849,28 @@ cmd_install() {
   chmod 755 "$INSTALL_BIN"
   load_config
   save_config
-  write_install_plist "$INSTALL_BIN"
-  launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
+  for legacy_label in $LEGACY_LABELS; do
+    rm -f "/Library/LaunchDaemons/${legacy_label}.plist"
+  done
+  write_install_plists "$INSTALL_BIN"
+  cmd_apply --force
   launchctl bootstrap system "$PLIST"
+  launchctl bootstrap system "$RECONCILE_PLIST"
   launchctl kickstart -k "system/${LABEL}"
   log "installed ${INSTALL_BIN} + ${CONF}"
-  cmd_apply
 }
 
 cmd_uninstall() {
   require_root
   load_config
   launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
-  rm -f "$PLIST"
+  launchctl bootout "system/${RECONCILE_LABEL}" >/dev/null 2>&1 || true
+  local legacy_label
+  for legacy_label in $LEGACY_LABELS; do
+    launchctl bootout "system/${legacy_label}" >/dev/null 2>&1 || true
+    rm -f "/Library/LaunchDaemons/${legacy_label}.plist"
+  done
+  rm -f "$PLIST" "$RECONCILE_PLIST"
   clear_applied
   log "uninstalled (config kept at ${CONF})"
 }
@@ -656,12 +890,13 @@ cmd_bundle() {
   if [[ -f "$CONF" ]]; then
     cp "$CONF" "$tmp/zyhy-private-split/zyhy-private-split.conf"
   else
-    WIFI_DOMAIN="$WIFI_DOMAIN" DOMAINS="$DOMAINS" SUFFIXES="$SUFFIXES" CIDRS="$CIDRS"
     cat >"$tmp/zyhy-private-split/zyhy-private-split.conf" <<EOF
 WIFI_DOMAIN="${WIFI_DOMAIN}"
 DOMAINS="${DOMAINS}"
 SUFFIXES="${SUFFIXES}"
 CIDRS="${CIDRS}"
+EVENT_SETTLE_SECONDS="${EVENT_SETTLE_SECONDS}"
+RECONCILE_INTERVAL="${RECONCILE_INTERVAL}"
 EOF
   fi
   cat >"$tmp/zyhy-private-split/INSTALL.txt" <<'EOF'
@@ -690,7 +925,7 @@ usage: $0 <command>
   list                   show domains / suffixes / CIDRs
   add <item>             add host, '*.suffix', or CIDR (needs sudo)
   remove <item>          remove one of the above (needs sudo)
-  apply                  apply now (needs sudo; daemon does this every 5s)
+  apply [--force]        apply now; --force also reconciles DNS (needs sudo)
   clear                  tear down routes (needs sudo)
   install                copy to /usr/local/sbin and load daemon (needs sudo)
   uninstall              remove daemon and routes; keep config (needs sudo)
@@ -703,7 +938,8 @@ cmd=${1:-status}
 shift || true
 load_config
 case "$cmd" in
-  apply) cmd_apply ;;
+  apply) cmd_apply "${1-}" ;;
+  watch) cmd_watch ;;
   clear) cmd_clear ;;
   status) cmd_status ;;
   list) cmd_list ;;
