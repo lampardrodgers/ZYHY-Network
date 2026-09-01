@@ -29,11 +29,12 @@ const rootCommands = new Set([
   'remove',
   'uninstall'
 ]);
+const intervalNeedsRoot = command === 'interval' && args.length > 1;
 
 let executable = '/bin/bash';
 let commandArgs = [script, ...args];
 
-if (rootCommands.has(command) && process.getuid?.() !== 0) {
+if ((rootCommands.has(command) || intervalNeedsRoot) && process.getuid?.() !== 0) {
   executable = '/usr/bin/sudo';
   commandArgs = ['/bin/bash', script, ...args];
 }

@@ -16,6 +16,11 @@ case "$command" in
       exec /usr/bin/sudo "$TARGET" "$@"
     fi
     ;;
+  interval)
+    if [[ $# -gt 1 && $(id -u) -ne 0 ]]; then
+      exec /usr/bin/sudo "$TARGET" "$@"
+    fi
+    ;;
 esac
 
 exec "$TARGET" "$@"

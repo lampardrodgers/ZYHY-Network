@@ -17,7 +17,7 @@
 set -euo pipefail
 
 LABEL="com.zyhy.network.split"
-VERSION="0.2.1"
+VERSION="0.2.2"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 RECONCILE_LABEL="${LABEL}.reconcile"
 RECONCILE_PLIST="/Library/LaunchDaemons/${RECONCILE_LABEL}.plist"
@@ -87,6 +87,7 @@ save_config() {
 #   add hostname:  sudo zyhy-private-split add foo.hq.cmcc
 #   add suffix:    sudo zyhy-private-split add '*.hq.cmcc'
 #   add CIDR:      sudo zyhy-private-split add 172.21.0.0/16
+#   timed check:   sudo zyhy-private-split interval 300 (0 disables)
 
 WIFI_DOMAIN="${WIFI_DOMAIN}"
 DOMAINS="${DOMAINS}"
@@ -617,6 +618,41 @@ cmd_refresh() {
   echo "refreshed: routes, DNS, hosts, resolvers and proxy exceptions checked"
 }
 
+cmd_interval() {
+  load_config
+  local seconds=${1-}
+  if [[ -z "$seconds" ]]; then
+    if (( RECONCILE_INTERVAL == 0 )); then
+      echo "timed check: disabled (0 seconds)"
+    else
+      echo "timed check: every ${RECONCILE_INTERVAL} seconds"
+    fi
+    return
+  fi
+
+  require_root
+  [[ "$seconds" =~ ^[0-9]+$ ]] || {
+    echo "usage: $0 interval <seconds>; 0 disables timed checks" >&2
+    exit 2
+  }
+  RECONCILE_INTERVAL=$seconds
+  save_config
+
+  launchctl bootout "system/${RECONCILE_LABEL}" >/dev/null 2>&1 || true
+  if [[ -x "$INSTALL_BIN" && -f "$PLIST" ]]; then
+    write_install_plists "$INSTALL_BIN"
+    if (( RECONCILE_INTERVAL > 0 )); then
+      bootstrap_with_retry "$RECONCILE_PLIST"
+    fi
+  fi
+
+  if (( RECONCILE_INTERVAL == 0 )); then
+    echo "timed check disabled; network-change watching remains enabled"
+  else
+    echo "timed check interval: ${RECONCILE_INTERVAL} seconds"
+  fi
+}
+
 cmd_status() {
   load_config
   local wifi eth pair
@@ -657,7 +693,11 @@ cmd_status() {
     $0==e{on=0}
   ' /etc/hosts || true
   echo "watcher     : $(launchctl print "system/${LABEL}" >/dev/null 2>&1 && echo loaded || echo not-loaded)"
-  echo "reconcile   : $(launchctl print "system/${RECONCILE_LABEL}" >/dev/null 2>&1 && echo "loaded (${RECONCILE_INTERVAL}s)" || echo not-loaded)"
+  if (( RECONCILE_INTERVAL == 0 )); then
+    echo "reconcile   : disabled (0s)"
+  else
+    echo "reconcile   : $(launchctl print "system/${RECONCILE_LABEL}" >/dev/null 2>&1 && echo "loaded (${RECONCILE_INTERVAL}s)" || echo "not-loaded (${RECONCILE_INTERVAL}s)")"
+  fi
   echo "sys proxy   : $(scutil --proxy | awk '/HTTPEnable/{e=$3} /HTTPProxy/{p=$3} /HTTPPort/{n=$3} END{if(e==1) print p":"n; else print "off"}')"
   echo "proxy bypass:"
   read_proxy_exceptions | sed 's/^/  /' || true
@@ -817,6 +857,12 @@ write_install_plists() {
 </plist>
 EOF
 
+  chmod 644 "$PLIST"
+  if (( RECONCILE_INTERVAL == 0 )); then
+    rm -f "$RECONCILE_PLIST"
+    return
+  fi
+
   cat >"$RECONCILE_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -839,7 +885,7 @@ EOF
 </dict>
 </plist>
 EOF
-  chmod 644 "$PLIST" "$RECONCILE_PLIST"
+  chmod 644 "$RECONCILE_PLIST"
 }
 
 bootstrap_with_retry() {
@@ -880,7 +926,7 @@ cmd_install() {
   write_install_plists "$INSTALL_BIN"
   cmd_apply --force
   bootstrap_with_retry "$PLIST"
-  if ! bootstrap_with_retry "$RECONCILE_PLIST"; then
+  if (( RECONCILE_INTERVAL > 0 )) && ! bootstrap_with_retry "$RECONCILE_PLIST"; then
     launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
     return 1
   fi
@@ -957,6 +1003,7 @@ usage: $0 <command>
   add <item>             add host, '*.suffix', or CIDR (needs sudo)
   remove <item>          remove one of the above (needs sudo)
   refresh                force DNS resolution and reconcile now (needs sudo)
+  interval [seconds]     show/set timed-check interval; 0 disables (set needs sudo)
   apply [--force]        apply now; --force also reconciles DNS (needs sudo)
   clear                  tear down routes (needs sudo)
   install                copy to /usr/local/sbin and load daemon (needs sudo)
@@ -972,6 +1019,7 @@ load_config
 case "$cmd" in
   apply) cmd_apply "${1-}" ;;
   refresh) cmd_refresh ;;
+  interval) cmd_interval "${1-}" ;;
   watch) cmd_watch ;;
   clear) cmd_clear ;;
   status) cmd_status ;;

@@ -1,6 +1,6 @@
 # ZYHY-Network
 
-当前版本：`V0.2.1`
+当前版本：`V0.2.2`
 
 让 Mac 同时使用公司网线和 `ZYHY-Private` Wi-Fi：普通网络走网线，OA、邮箱等内网地址自动走 Wi-Fi。
 
@@ -8,7 +8,7 @@
 
 - 仅在网线已连接且 Wi-Fi 为 `ZYHY-Private` 时启用分流
 - 监听 macOS 网络变化并自动更新，不再每 5 秒轮询
-- 每 5 分钟低频校验一次，配置未变化时不重写网络设置
+- 默认每 300 秒低频校验一次，可修改间隔或关闭
 - 支持 `zyhy-network refresh` 立即刷新 DNS、路由和分流配置
 - GitHub 与 npm 安装提供相同的 `zyhy-network` 命令
 
@@ -16,11 +16,17 @@
 
 GitHub：
 
+请按顺序逐行执行下面三条命令。安装完成后不需要再手动运行其他脚本。
+
 ```bash
 git clone https://github.com/lampardrodgers/ZYHY-Network.git
 cd ZYHY-Network
 sudo ./install.sh
 ```
+
+`sudo ./install.sh` 会安装并启动后台服务。之后，网线、Wi-Fi、IP、网关或
+DNS 发生变化时，程序会自动重新判断是否启用内网分流；网络状态没有变化时
+不会重复修改系统网络配置。
 
 npm：
 
@@ -36,6 +42,9 @@ zyhy-network install
 ```bash
 zyhy-network status                 # 查看状态
 zyhy-network refresh                # 强制刷新
+zyhy-network interval               # 查看定时校验设置
+zyhy-network interval 600           # 改为每 600 秒校验
+zyhy-network interval 0             # 关闭定时校验
 zyhy-network add '*.hq.cmcc'        # 添加域名后缀
 zyhy-network add 172.21.0.0/16      # 添加网段
 zyhy-network uninstall              # 卸载，保留配置
