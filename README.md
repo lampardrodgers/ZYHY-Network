@@ -1,13 +1,13 @@
 # ZYHY-Network
 
-当前版本：`V0.2.2`
+当前版本：`V0.2.3`
 
 让 Mac 同时使用公司网线和 `ZYHY-Private` Wi-Fi：普通网络走网线，OA、邮箱等内网地址自动走 Wi-Fi。
 
 ## 功能
 
 - 仅在网线已连接且 Wi-Fi 为 `ZYHY-Private` 时启用分流
-- 监听 macOS 网络变化并自动更新，不再每 5 秒轮询
+- 监听 macOS 网络与系统代理变化并自动更新，不再每 5 秒轮询
 - 默认每 300 秒低频校验一次，可修改间隔或关闭
 - 支持 `zyhy-network refresh` 立即刷新 DNS、路由和分流配置
 - GitHub 与 npm 安装提供相同的 `zyhy-network` 命令
@@ -53,4 +53,5 @@ zyhy-network uninstall              # 卸载，保留配置
 ## 注意
 
 - 网线和 `ZYHY-Private` Wi-Fi 需要同时连接；网络变化后会自动恢复分流
+- 系统代理工具重启或切换后，会自动恢复内网域名的代理绕过项
 - Chrome 若无法打开内网，请关闭“设置 → 隐私和安全 → 安全 → 使用安全 DNS”

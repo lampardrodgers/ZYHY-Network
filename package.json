@@ -1,6 +1,6 @@
 {
   "name": "@sunjiehao/zyhy-network",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "macOS Ethernet and ZYHY-Private Wi-Fi split routing CLI",
   "bin": {
     "zyhy-network": "bin/zyhy-network.js"

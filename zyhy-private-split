@@ -17,7 +17,7 @@
 set -euo pipefail
 
 LABEL="com.zyhy.network.split"
-VERSION="0.2.2"
+VERSION="0.2.3"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 RECONCILE_LABEL="${LABEL}.reconcile"
 RECONCILE_PLIST="/Library/LaunchDaemons/${RECONCILE_LABEL}.plist"
@@ -317,7 +317,8 @@ http_proxy_keys() {
   echo "State:/Network/Global/Proxies"
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
-    if echo "show ${key}" | scutil | grep -q 'HTTPEnable : 1'; then
+    if echo "show ${key}" | scutil \
+      | grep -Eq '(HTTPEnable|HTTPSEnable|SOCKSEnable|ProxyAutoConfigEnable) : 1'; then
       printf '%s\n' "$key"
     fi
   done < <(echo "list State:/Network/Service/.*/Proxies" | scutil | awk -F'= ' '/subKey/{print $2}')
@@ -336,12 +337,11 @@ read_proxy_exceptions() {
   '
 }
 
-write_proxy_exceptions() {
+write_proxy_exceptions_for_key() {
+  local key=$1
+  shift
   local items=$*
-  local key
-  [[ -n "$items" ]] || return 0
-  while IFS= read -r key; do
-    [[ -n "$key" ]] || continue
+  if [[ -n "$items" ]]; then
     scutil >/dev/null <<EOF
 open
 d.init
@@ -350,7 +350,16 @@ d.add ExceptionsList * ${items}
 set ${key}
 quit
 EOF
-  done < <(http_proxy_keys | awk 'NF && !seen[$0]++')
+  else
+    scutil >/dev/null <<EOF
+open
+d.init
+get ${key}
+d.remove ExceptionsList
+set ${key}
+quit
+EOF
+  fi
 }
 
 list_has() {
@@ -364,51 +373,69 @@ list_has() {
 }
 
 ensure_proxy_exceptions() {
-  local -a cur=() want=() merged=()
-  local x
-  while IFS= read -r x; do
-    [[ -n "$x" ]] && cur+=("$x")
-  done < <(read_proxy_exceptions "")
+  local -a want=()
+  local key x changed=0
   while IFS= read -r x; do
     [[ -n "$x" ]] && want+=("$x")
   done < <(wanted_proxy_exceptions | awk 'NF && !seen[$0]++')
-  if [[ ${#cur[@]} -gt 0 ]]; then
-    merged=("${cur[@]}")
-  fi
-  for x in "${want[@]}"; do
-    if [[ ${#cur[@]} -gt 0 ]] && list_has "$x" "${cur[@]}"; then
+
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    local -a cur=() merged=()
+    while IFS= read -r x; do
+      [[ -n "$x" ]] && cur+=("$x")
+    done < <(read_proxy_exceptions "$key")
+    if [[ ${#cur[@]} -gt 0 ]]; then
+      merged=("${cur[@]}")
+    fi
+    for x in "${want[@]}"; do
+      if [[ ${#cur[@]} -gt 0 ]] && list_has "$x" "${cur[@]}"; then
+        continue
+      fi
+      merged+=("$x")
+    done
+    if [[ ${#merged[@]} -eq ${#cur[@]} ]]; then
       continue
     fi
-    merged+=("$x")
-  done
-  if [[ ${#merged[@]} -eq ${#cur[@]} ]]; then
-    return 0
+    write_proxy_exceptions_for_key "$key" "${merged[@]}"
+    changed=1
+  done < <(http_proxy_keys | awk 'NF && !seen[$0]++')
+
+  if (( changed )); then
+    log "proxy bypass +${want[*]}"
   fi
-  write_proxy_exceptions "${merged[*]}"
-  log "proxy bypass +${want[*]}"
 }
 
 remove_proxy_exceptions() {
-  local -a cur=() keep=() want=()
-  local x
-  while IFS= read -r x; do
-    [[ -n "$x" ]] && cur+=("$x")
-  done < <(read_proxy_exceptions "")
-  [[ ${#cur[@]} -gt 0 ]] || return 0
+  local -a want=()
+  local key x changed=0
   while IFS= read -r x; do
     [[ -n "$x" ]] && want+=("$x")
   done < <(wanted_proxy_exceptions)
-  for x in "${cur[@]}"; do
-    if [[ ${#want[@]} -gt 0 ]] && list_has "$x" "${want[@]}"; then
+
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    local -a cur=() keep=()
+    while IFS= read -r x; do
+      [[ -n "$x" ]] && cur+=("$x")
+    done < <(read_proxy_exceptions "$key")
+    [[ ${#cur[@]} -gt 0 ]] || continue
+    for x in "${cur[@]}"; do
+      if [[ ${#want[@]} -gt 0 ]] && list_has "$x" "${want[@]}"; then
+        continue
+      fi
+      keep+=("$x")
+    done
+    if [[ ${#keep[@]} -eq ${#cur[@]} ]]; then
       continue
     fi
-    keep+=("$x")
-  done
-  if [[ ${#keep[@]} -eq ${#cur[@]} ]]; then
-    return 0
+    write_proxy_exceptions_for_key "$key" "${keep[@]}"
+    changed=1
+  done < <(http_proxy_keys | awk 'NF && !seen[$0]++')
+
+  if (( changed )); then
+    log "proxy bypass restored"
   fi
-  write_proxy_exceptions "${keep[*]}"
-  log "proxy bypass restored"
 }
 
 drop_state_entry() {
@@ -506,6 +533,10 @@ cmd_apply_locked() {
     return 0
   fi
 
+  # Proxy apps can replace ExceptionsList without changing IP, gateway, or DNS.
+  # Repair it before the network-input fast path so proxy-only events are enough.
+  ensure_proxy_exceptions
+
   local input_tmp
   input_tmp=$(mktemp)
   write_network_inputs "$input_tmp" "$eth" "$wifi" "$wifi_ip" "$wifi_gw" "$wifi_dns"
@@ -555,7 +586,6 @@ cmd_apply_locked() {
 
   write_resolvers "$wifi_dns"
   write_hosts_block "$hosts_body"
-  ensure_proxy_exceptions
 
   local tmp state_changed=0
   tmp=$(mktemp)
@@ -796,8 +826,8 @@ start_network_event_stream() {
   exec 3>"$WATCH_COMMAND_FIFO"
   exec 4<"$WATCH_EVENT_FIFO"
   cat >&3 <<'EOF'
-n.add ^State:/Network/(Global/(IPv4|DNS)|Interface/.*/(IPv4|Link|AirPort)|Service/.*/(DHCP|DNS|IPv4))$ pattern
-n.add ^Setup:/Network/Service/.*/(DNS|IPv4)$ pattern
+n.add ^State:/Network/(Global/(IPv4|DNS|Proxies)|Interface/.*/(IPv4|Link|AirPort)|Service/.*/(DHCP|DNS|IPv4|Proxies))$ pattern
+n.add ^Setup:/Network/(Global/Proxies|Service/.*/(DNS|IPv4|Proxies))$ pattern
 n.watch
 EOF
 }
