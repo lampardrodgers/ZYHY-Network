@@ -17,7 +17,7 @@
 set -euo pipefail
 
 LABEL="com.zyhy.network.split"
-VERSION="0.2.3"
+VERSION="0.2.4"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 RECONCILE_LABEL="${LABEL}.reconcile"
 RECONCILE_PLIST="/Library/LaunchDaemons/${RECONCILE_LABEL}.plist"
@@ -39,7 +39,7 @@ HOSTS_END="# END zyhy-private-split"
 
 # Defaults (overridden by $CONF).
 WIFI_DOMAIN="ZYHY-Private"
-DOMAINS="oa.hq.cmcc mail.cmhi.chinamobile.com"
+DOMAINS="oa.hq.cmcc mail.cmhi.chinamobile.com oa.komect.com"
 SUFFIXES="hq.cmcc cmhi.chinamobile.com"
 CIDRS="172.21.0.0/16 172.16.0.0/16"
 RECONCILE_INTERVAL="300"
