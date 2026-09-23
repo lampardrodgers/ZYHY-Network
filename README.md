@@ -1,6 +1,6 @@
 # ZYHY-Network
 
-当前版本：`V0.2.4`
+当前版本：`V0.2.5`
 
 默认包含 `oa.hq.cmcc`、`mail.cmhi.chinamobile.com` 和 `oa.komect.com` 的内网分流。
 已有安装保留原配置时，执行 `zyhy-network add oa.komect.com` 即可补充新域名。

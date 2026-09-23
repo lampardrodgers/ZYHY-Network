@@ -17,7 +17,7 @@
 set -euo pipefail
 
 LABEL="com.zyhy.network.split"
-VERSION="0.2.4"
+VERSION="0.2.5"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 RECONCILE_LABEL="${LABEL}.reconcile"
 RECONCILE_PLIST="/Library/LaunchDaemons/${RECONCILE_LABEL}.plist"
@@ -203,6 +203,15 @@ del_net_v4() {
   route -n delete -net "$1" >/dev/null 2>&1 || true
 }
 
+add_reject_v6() {
+  local ip=$1
+  if route -n get -inet6 "$ip" 2>/dev/null | grep -q "REJECT"; then
+    return 0
+  fi
+  route -n delete -inet6 -host "$ip" >/dev/null 2>&1 || true
+  route -n add -inet6 -host "$ip" ::1 -reject >/dev/null
+}
+
 del_reject_v6() {
   route -n delete -inet6 -host "$1" >/dev/null 2>&1 || true
 }
@@ -299,6 +308,13 @@ resolve_via_wifi() {
   local wifi_ip=$1 dns=$2 name=$3
   dig -b "$wifi_ip" @"$dns" +short +time=2 +tries=1 "$name" A \
     | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{print}' \
+    | sort -u
+}
+
+resolve_via_wifi_v6() {
+  local wifi_ip=$1 dns=$2 name=$3
+  dig -b "$wifi_ip" @"$dns" +short +time=2 +tries=1 "$name" AAAA \
+    | awk '/:/ && /^[0-9a-fA-F:]+$/{print}' \
     | sort -u
 }
 
@@ -582,6 +598,16 @@ cmd_apply_locked() {
         hosts_body+="${ip} ${d}"$'\n'
       fi
     done <<<"$resolved"
+  done
+
+  # AAAA replies make browsers try IPv6 first; TUN proxy tools capture the
+  # default v6 route, so reject each intranet v6 host to force a fast v4 fallback.
+  for d in $DOMAINS; do
+    while read -r ip; do
+      [[ -n "$ip" ]] || continue
+      add_reject_v6 "$ip"
+      lines+=("v6 $ip")
+    done < <(resolve_via_wifi_v6 "$wifi_ip" "$wifi_dns" "$d" || true)
   done
 
   write_resolvers "$wifi_dns"
